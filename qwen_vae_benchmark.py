@@ -212,20 +212,20 @@ class _EnvCtx:
             else: os.environ[k] = old
 
 @torch.no_grad()
-def bench_encode(vae: QwenVAE, img: torch.Tensor, dtype: str, tiled: bool, tile_px: int) -> float:
+def bench_encode(vae: QwenVAE, img: torch.Tensor, dtype: str, tiled: bool) -> float:
     start = time.perf_counter()
     _ = vae.encode(img, dtype=dtype)
     time_sync()
     return time.perf_counter() - start
 
 @torch.no_grad()
-def bench_decode(vae: QwenVAE, lat: torch.Tensor, dtype: str, tiled: bool, tile_px: int) -> float:
+def bench_decode(vae: QwenVAE, lat: torch.Tensor, dtype: str, tiled: bool) -> float:
     start = time.perf_counter()
     _ = vae.decode(lat, dtype=dtype)
     time_sync()
     return time.perf_counter() - start
 
-def run_once(vae, img, lat, *, dtype: str, tiled: bool, tile_px: int, warmup: int, env: Dict[str,str]) -> Tuple[float,float]:
+def run_once(vae, img, lat, *, dtype: str, tiled: bool, warmup: int, env: Dict[str,str]) -> Tuple[float,float]:
     with _EnvCtx(env):
         if hasattr(vae.vae, "enable_tiling") and hasattr(vae.vae, "disable_tiling"):
             if tiled:
@@ -233,10 +233,10 @@ def run_once(vae, img, lat, *, dtype: str, tiled: bool, tile_px: int, warmup: in
             else:
                 vae.vae.disable_tiling()
         for _ in range(max(0, warmup)):
-            _ = bench_encode(vae, img, dtype, tiled, tile_px)
-            _ = bench_decode(vae, lat, dtype, tiled, tile_px)
-        enc_s = bench_encode(vae, img, dtype, tiled, tile_px)
-        dec_s = bench_decode(vae, lat, dtype, tiled, tile_px)
+            _ = bench_encode(vae, img, dtype, tiled)
+            _ = bench_decode(vae, lat, dtype, tiled)
+        enc_s = bench_encode(vae, img, dtype, tiled)
+        dec_s = bench_decode(vae, lat, dtype, tiled)
     return enc_s, dec_s
 
 # -----------------------------
@@ -246,8 +246,6 @@ def main():
     ap = argparse.ArgumentParser(description="Standalone Qwen-Image VAE micro-benchmark (ROCm/Strix Halo)")
     ap.add_argument("--preset", choices=["1664x928","1328x1328","both"], default="1664x928",
                     help="Qwen-native sizes to test (default: 1664x928)")
-    ap.add_argument("--tile_px", type=int, default=512, help="Tile size in pixels (default 512)")
-    ap.add_argument("--tile_sweep", default="", help="Comma-separated tile sizes for auto sweep. Empty to skip.")
     ap.add_argument("--warmup", type=int, default=1, help="Warmup iterations per config (default 1)")
     ap.add_argument("--fast", action="store_true", help="Run only fp32+tiled with --tile_px (skip baselines/sweep)")
     args = ap.parse_args()
@@ -323,21 +321,21 @@ def main():
         # FAST MODE
         if args.fast:
             print("-- FAST MODE: fp32+tiled only --")
-            print(f"   dtype=fp32, tiled=True, env=default, tile_px={args.tile_px}")
-            enc_s, dec_s = run_once(vae, img, lat, dtype="fp32", tiled=True, tile_px=args.tile_px, warmup=args.warmup, env={})
-            record("fp32-tiled-fast", "fp32", True, args.tile_px, {}, enc_s, dec_s)
+            print(f"   dtype=fp32, tiled=native, env=default, tile_px=auto")
+            enc_s, dec_s = run_once(vae, img, lat, dtype="fp32", tiled=True, warmup=args.warmup, env={})
+            record("fp32-tiled-fast", "fp32", True, "auto", {}, enc_s, dec_s)
             _print_summary(results)
             continue
 
         # Baselines (untiled)
         print("-- Test: fp32-baseline")
         print("   dtype=fp32, tiled=False, env=default")
-        enc_s, dec_s = run_once(vae, img, lat, dtype="fp32", tiled=False, tile_px=args.tile_px, warmup=args.warmup, env={})
+        enc_s, dec_s = run_once(vae, img, lat, dtype="fp32", tiled=False, warmup=args.warmup, env={})
         record("fp32-baseline", "fp32", False, None, {}, enc_s, dec_s)
 
         print("-- Test: bf16-baseline")
         print("   dtype=bf16, tiled=False, env=default")
-        enc_s, dec_s = run_once(vae, img, lat, dtype="bf16", tiled=False, tile_px=args.tile_px, warmup=args.warmup, env={})
+        enc_s, dec_s = run_once(vae, img, lat, dtype="bf16", tiled=False, warmup=args.warmup, env={})
         record("bf16-baseline", "bf16", False, None, {}, enc_s, dec_s)
 
         # Untiled with MIOpen env toggles
@@ -352,9 +350,10 @@ def main():
 
         # Single tiled run (user tile)
         print("-- Test: fp32-tiled")
-        print(f"   dtype=fp32, tiled=native, env=default")
-        enc_s, dec_s = run_once(vae, img, lat, dtype="fp32", tiled=True, tile_px=args.tile_px, warmup=args.warmup, env={})
-        record("fp32-tiled", "fp32", True, args.tile_px, {}, enc_s, dec_s)
+        print(f"   dtype=fp32, tiled=native, env=default, tile_px=auto")
+        enc_s, dec_s = run_once(vae, img, lat, dtype="fp32", tiled=True, tile_px=0, warmup=args.warmup, env={})
+        record("fp32-tiled", "fp32", True, "auto", {}, enc_s, dec_s)
+
 
         # Auto tile sweep (fp32, tiled)
         sweep = [int(s.strip()) for s in args.tile_sweep.split(",") if s.strip().isdigit()] if args.tile_sweep else []
@@ -385,9 +384,9 @@ def main():
                 ("fp32-tiled-disable-naive-best", {"MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_FWD": "0"}),
             ]:
                 print(f"-- Test: {env_name}")
-                print(f"   dtype=fp32, tiled=True, env={env_vars}, tile_px={best_tile}")
-                enc_s, dec_s = run_once(vae, img, lat, dtype="fp32", tiled=True, tile_px=best_tile, warmup=args.warmup, env=env_vars)
-                record(env_name, "fp32", True, best_tile, env_vars, enc_s, dec_s)
+                print(f"   dtype=fp32, tiled=native, env={env_vars}, tile_px=auto")
+                enc_s, dec_s = run_once(vae, img, lat, dtype="fp32", tiled=True, tile_px=0, warmup=args.warmup, env=env_vars)
+                record(env_name, "fp32", True, "auto", env_vars, enc_s, dec_s)
 
         _print_summary(results)
 
@@ -397,7 +396,7 @@ def main():
 def _print_summary(results: List[Dict]):
     if not results: return
     print("\n== Summary (sorted by total time) ==")
-    headers = ["name","dtype","tiled","tile_px","encode_s","decode_s","total_s"]
+    headers = ["name","dtype","tiled","encode_s","decode_s","total_s"]
     widths = [max(len(h), 12) for h in headers]
     rows = []
     for r in sorted(results, key=lambda r: r["total_s"]):
@@ -405,7 +404,6 @@ def _print_summary(results: List[Dict]):
             r["name"],
             r["dtype"],
             str(r["tiled"]),
-            str(r["tile_px"]) if r["tile_px"] is not None else "-",
             f"{r['encode_s']:.4f}",
             f"{r['decode_s']:.4f}",
             f"{r['total_s']:.4f}",
