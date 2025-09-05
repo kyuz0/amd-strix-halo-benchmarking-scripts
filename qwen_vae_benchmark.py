@@ -345,13 +345,13 @@ def main():
         ]:
             print(f"-- Test: {env_name}")
             print(f"   dtype=fp32, tiled=False, env={env_vars}")
-            enc_s, dec_s = run_once(vae, img, lat, dtype="fp32", tiled=False, tile_px=args.tile_px, warmup=args.warmup, env=env_vars)
+            enc_s, dec_s = run_once(vae, img, lat, dtype="fp32", tiled=False, warmup=args.warmup, env=env_vars)
             record(env_name, "fp32", False, None, env_vars, enc_s, dec_s)
 
         # Single tiled run (user tile)
         print("-- Test: fp32-tiled")
         print(f"   dtype=fp32, tiled=native, env=default, tile_px=auto")
-        enc_s, dec_s = run_once(vae, img, lat, dtype="fp32", tiled=True, tile_px=0, warmup=args.warmup, env={})
+        enc_s, dec_s = run_once(vae, img, lat, dtype="fp32", tiled=True, warmup=args.warmup, env={})
         record("fp32-tiled", "fp32", True, "auto", {}, enc_s, dec_s)
 
 
