@@ -302,10 +302,12 @@ def main():
         # Tensors
         B = 1
         img  = torch.zeros(B, 3, H, W, device=device, dtype=torch.float32)
-        # derive latent shape via a quick probe to be precise
-        with torch.no_grad(), torch.amp.autocast('cuda', dtype=torch.float32):
-            probe = vae.encode(img, dtype="fp32")
-        lat  = torch.zeros(B, probe.shape[1], probe.shape[2], probe.shape[3], device=device, dtype=torch.float32)
+
+        # FAST: derive latent shape directly (Qwen down_factor is 8, presets are divisible)
+        latent_ch = getattr(vae.vae.config, "latent_channels", 4)  # usually 4
+        lat_h = H // vae.down_factor
+        lat_w = W // vae.down_factor
+        lat   = torch.zeros(B, latent_ch, lat_h, lat_w, device=device, dtype=torch.float32)
 
         print(f"Shapes being tested ({W}x{H}):")
         print(f"  Encode input (image) : {tuple(img.shape)}")
