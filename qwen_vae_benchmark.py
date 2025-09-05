@@ -304,7 +304,7 @@ def main():
         img  = torch.zeros(B, 3, H, W, device=device, dtype=torch.float32)
 
         # FAST: derive latent shape directly (Qwen down_factor is 8, presets are divisible)
-        latent_ch = getattr(vae.vae.config, "latent_channels", 4)  # usually 4
+        latent_ch = getattr(vae.vae.config, "latent_channels", 16)
         lat_h = H // vae.down_factor
         lat_w = W // vae.down_factor
         lat   = torch.zeros(B, latent_ch, lat_h, lat_w, device=device, dtype=torch.float32)
