@@ -143,41 +143,44 @@ class QwenVAE:
     @torch.no_grad()
     def _infer_downsample_factor(self) -> int:
         H, W = 64, 64
-        x = torch.zeros(1, 3, H, W, device=self.device, dtype=torch.float32)
+        # Qwen VAE expects [B, C, T, H, W]; use T=1 for images
+        x = torch.zeros(1, 3, 1, H, W, device=self.device, dtype=torch.float32)
         with torch.amp.autocast('cuda', dtype=torch.float32):
             posterior = self.vae.encode(x).latent_dist
-            z = posterior.mean * self.scaling_factor
-        lh, lw = z.shape[-2:]
-        # guard
-        if lh == 0 or lw == 0:
-            return 8
-        # nearest power-of-two factor
+            z = posterior.mean * self.scaling_factor  # [B, C_lat, T, H/df, W/df]
+        _, _, _, lh, lw = z.shape
         df_h = max(1, round(H / lh))
         df_w = max(1, round(W / lw))
         return int((df_h + df_w) // 2)
 
+
     @torch.no_grad()
     def encode(self, images: torch.Tensor, dtype: str = "fp32"):
         """
-        images: [B, 3, H, W], values are arbitrary for benchmarking.
-        Returns z: [B, latent_channels, H/df, W/df]
+        images: [B, 3, H, W]
+        returns z: [B, C_lat, H/df, W/df]
         """
         amp_dtype = torch.bfloat16 if dtype == "bf16" else torch.float32
+        # Add T=1 for Qwen
+        x = images.unsqueeze(2)  # [B,3,1,H,W]
         with torch.amp.autocast('cuda', dtype=amp_dtype):
-            posterior = self.vae.encode(images).latent_dist
-            z = posterior.mean * self.scaling_factor
-        return z.float()
+            posterior = self.vae.encode(x).latent_dist
+            z = posterior.mean * self.scaling_factor  # [B,C,1,H/df,W/df]
+        return z.squeeze(2).float()
+
 
     @torch.no_grad()
     def decode(self, latents: torch.Tensor, dtype: str = "fp32"):
         """
-        latents: [B, latent_channels, H/df, W/df]
-        Returns recon: [B, 3, H, W] in [-1, 1]
+        latents: [B, C_lat, H/df, W/df]
+        returns images: [B, 3, H, W]
         """
         amp_dtype = torch.bfloat16 if dtype == "bf16" else torch.float32
+        z = latents.unsqueeze(2)  # [B,C,1,H/df,W/df]
         with torch.amp.autocast('cuda', dtype=amp_dtype):
-            x = self.vae.decode(latents / self.scaling_factor).sample
-        return x.float().clamp_(-1, 1)
+            x = self.vae.decode(z / self.scaling_factor).sample  # [B,3,1,H,W]
+        return x.squeeze(2).float().clamp_(-1, 1)
+
 
 # -----------------------------
 # Benchmark helpers (2D tiling)
