@@ -1,0 +1,85 @@
+python wan_vae_benchmark.py --frames 5 --size "832*480" --warmup 0
+========================================================================
+WAN 2.1/2.2 VAE Micro-Benchmark (Standalone)
+========================================================================
+PyTorch                : 2.7.1+rocm7.0.0rc20250903
+HIP (torch.version.hip): 7.1.25353-0cbc13abe8
+ROCm pkg version       : 7.0.0rc20250903
+Kernel                 : 6.16.3-200.fc42.x86_64  (#1 SMP PREEMPT_DYNAMIC Sat Aug 23 17:02:17 UTC 2025)
+Distro                 : Fedora Linux 44 (Container Image Prerelease)
+GPU:
+  torch_device_name: AMD Radeon Graphics
+  marketing_name: AMD RYZEN AI MAX+ 395 w/ Radeon 8060S
+  gfx_name: gfx1151
+
+Shapes being tested:
+  Encode input (video) : torch.Size([3, 5, 480, 832])
+    ~22.85 MiB  (23.96 MB) @ float32
+    ~11.43 MiB  (11.98 MB) @ bfloat16 (autocast)
+  Decode input (latent): torch.Size([16, 2, 60, 104])
+    ~0.76 MiB  (0.80 MB) @ float32
+    ~0.38 MiB  (0.40 MB) @ bfloat16 (autocast)
+  Frames (video)       : 5  →  Frames (latent): 2  (t-stride=4)
+  Resolution           : 832x480  →  Latent: 104x60  (h-stride=8, w-stride=8)
+
+-- Test: fp32-baseline
+   dtype=fp32, tiled=False, env=default
+   Encode: 38.8910s   Decode: 58.8774s
+
+-- Test: fp32-tiled
+   dtype=fp32, tiled=True, env=default, tile_px=256
+   Encode: 5.7268s   Decode: 8.5669s
+
+-- Test: fp32-fastfind
+   dtype=fp32, tiled=False, env={'MIOPEN_FIND_MODE': '2'}
+   Encode: 36.6593s   Decode: 58.4349s
+
+-- Test: fp32-disable-naive
+   dtype=fp32, tiled=False, env={'MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_FWD': '0'}
+   Encode: 36.2417s   Decode: 58.1993s
+
+-- Test: bf16-baseline
+   dtype=bf16, tiled=False, env=default
+   Encode: 36.4120s   Decode: 58.0994s
+
+-- Auto tile sweep (FP32, tiled) --------------------------------
+   test tile_px=256
+   Encode: 5.0128s   Decode: 8.1314s
+
+   test tile_px=192
+   Encode: 5.2001s   Decode: 8.3312s
+
+   test tile_px=128
+   Encode: 4.9870s   Decode: 8.0376s
+
+   → Best tile size: 128 px (total 13.0246s)
+
+-- Test: bf16-tiled(best)
+   dtype=bf16, tiled=True, env=default, tile_px=128
+   Encode: 4.9858s   Decode: 8.0633s
+
+-- Test: fp32-tiled-fastfind-best
+   dtype=fp32, tiled=True, env={'MIOPEN_FIND_MODE': '2'}, tile_px=128
+   Encode: 5.0024s   Decode: 9.5714s
+
+-- Test: fp32-tiled-disable-naive-best
+   dtype=fp32, tiled=True, env={'MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_FWD': '0'}, tile_px=128
+   Encode: 6.3403s   Decode: 10.9219s
+
+
+== Summary (sorted by total time) ==
+name          dtype         tiled         tile_px       encode_s      decode_s      total_s     
+------------------------------------------------------------------------------------------------
+fp32-tiled-128  fp32          True          128           4.9870        8.0376        13.0246     
+bf16-tiled-best  bf16          True          128           4.9858        8.0633        13.0492     
+fp32-tiled-256  fp32          True          256           5.0128        8.1314        13.1443     
+fp32-tiled-192  fp32          True          192           5.2001        8.3312        13.5313     
+fp32-tiled    fp32          True          256           5.7268        8.5669        14.2937     
+fp32-tiled-fastfind-best  fp32          True          128           5.0024        9.5714        14.5738     
+fp32-tiled-disable-naive-best  fp32          True          128           6.3403        10.9219       17.2622     
+fp32-disable-naive  fp32          False         -             36.2417       58.1993       94.4410     
+bf16-baseline  bf16          False         -             36.4120       58.0994       94.5114     
+fp32-fastfind  fp32          False         -             36.6593       58.4349       95.0942     
+fp32-baseline  fp32          False         -             38.8910       58.8774       97.7684     
+
+Done.

@@ -604,6 +604,8 @@ def main():
     ap.add_argument("--tile_px", type=int, default=256, help="Encode tile size in pixels when tiled")
     ap.add_argument("--warmup", type=int, default=1, help="Warmup iterations per config")
     ap.add_argument("--tile_sweep", default="256,192,128", help="Comma-separated tile sizes for auto sweep (FP32). Empty to skip.")
+    ap.add_argument("--fast", action="store_true",
+                help="Run only the best known config (fp32+tiled, tile_px)")
     args = ap.parse_args()
 
     # Size
@@ -676,6 +678,43 @@ def main():
             "total_s": enc_s + dec_s
         })
         print(f"   Encode: {enc_s:.4f}s   Decode: {dec_s:.4f}s\n")
+
+
+    # >>> FAST MODE: bail out early after one fp32+tiled run
+    if args.fast:
+        print("-- FAST MODE: fp32+tiled only --")
+        print(f"   dtype=fp32, tiled=True, env=default, tile_px={args.tile_px}")
+        enc_s, dec_s = run_once(
+            vae, video, latent,
+            dtype="fp32", tiled=True, tile_px=args.tile_px,
+            warmup=args.warmup, env={}
+        )
+        record("fp32-tiled-fast", "fp32", True, args.tile_px, {}, enc_s, dec_s)
+
+        # Summary table (reuse same printing style)
+        if results:
+            print("\n== Summary (sorted by total time) ==")
+            headers = ["name","dtype","tiled","tile_px","encode_s","decode_s","total_s"]
+            widths = [max(len(h), 12) for h in headers]
+            rows = []
+            for r in sorted(results, key=lambda r: r["total_s"]):
+                rows.append([
+                    r["name"],
+                    r["dtype"],
+                    str(r["tiled"]),
+                    str(r["tile_px"]) if r["tile_px"] is not None else "-",
+                    f"{r['encode_s']:.4f}",
+                    f"{r['decode_s']:.4f}",
+                    f"{r['total_s']:.4f}",
+                ])
+            line = "  ".join(h.ljust(w) for h,w in zip(headers, widths))
+            print(line); print("-" * len(line))
+            for row in rows:
+                print("  ".join(s.ljust(w) for s,w in zip(row, widths)))
+
+        print("\nDone.")
+        return 0
+    # <<< end FAST MODE
 
     # 1) FP32 baseline (untiled)
     print("-- Test: fp32-baseline")
