@@ -213,25 +213,38 @@ class _EnvCtx:
 
 @torch.no_grad()
 def bench_encode(vae: QwenVAE, img: torch.Tensor, dtype: str, tiled: bool, tile_px: int) -> float:
+    _, _, H, W = img.shape
     start = time.perf_counter()
-    _ = vae.encode(img, dtype=dtype)
+    if not tiled:
+        _ = vae.encode(img, dtype=dtype)
+    else:
+        th = tw = tile_px
+        for y0 in range(0, H, th):
+            for x0 in range(0, W, tw):
+                y1 = min(y0 + th, H); x1 = min(x0 + tw, W)
+                tile = pad_to_stride_2d(img[:, :, y0:y1, x0:x1].contiguous(), vae.down_factor, vae.down_factor)
+                _ = vae.encode(tile, dtype=dtype)
     time_sync()
     return time.perf_counter() - start
 
 @torch.no_grad()
 def bench_decode(vae: QwenVAE, lat: torch.Tensor, dtype: str, tiled: bool, tile_px: int) -> float:
+    _, _, LH, LW = lat.shape
     start = time.perf_counter()
-    _ = vae.decode(lat, dtype=dtype)
+    if not tiled:
+        _ = vae.decode(lat, dtype=dtype)
+    else:
+        # map pixel tile to latent tile by down_factor
+        step = max(1, tile_px // vae.down_factor)
+        for y0 in range(0, LH, step):
+            for x0 in range(0, LW, step):
+                y1 = min(y0 + step, LH); x1 = min(x0 + step, LW)
+                _ = vae.decode(lat[:, :, y0:y1, x0:x1].contiguous(), dtype=dtype)
     time_sync()
     return time.perf_counter() - start
 
 def run_once(vae, img, lat, *, dtype: str, tiled: bool, tile_px: int, warmup: int, env: Dict[str,str]) -> Tuple[float,float]:
     with _EnvCtx(env):
-        if hasattr(vae.vae, "enable_tiling") and hasattr(vae.vae, "disable_tiling"):
-            if tiled:
-                vae.vae.enable_tiling()
-            else:
-                vae.vae.disable_tiling()
         for _ in range(max(0, warmup)):
             _ = bench_encode(vae, img, dtype, tiled, tile_px)
             _ = bench_decode(vae, lat, dtype, tiled, tile_px)
@@ -247,7 +260,7 @@ def main():
     ap.add_argument("--preset", choices=["1664x928","1328x1328","both"], default="1664x928",
                     help="Qwen-native sizes to test (default: 1664x928)")
     ap.add_argument("--tile_px", type=int, default=512, help="Tile size in pixels (default 512)")
-    ap.add_argument("--tile_sweep", default="", help="Comma-separated tile sizes for auto sweep. Empty to skip.")
+    ap.add_argument("--tile_sweep", default="512,384,256", help="Comma-separated tile sizes for auto sweep. Empty to skip.")
     ap.add_argument("--warmup", type=int, default=1, help="Warmup iterations per config (default 1)")
     ap.add_argument("--fast", action="store_true", help="Run only fp32+tiled with --tile_px (skip baselines/sweep)")
     args = ap.parse_args()
@@ -352,7 +365,7 @@ def main():
 
         # Single tiled run (user tile)
         print("-- Test: fp32-tiled")
-        print(f"   dtype=fp32, tiled=native, env=default")
+        print(f"   dtype=fp32, tiled=True, env=default, tile_px={args.tile_px}")
         enc_s, dec_s = run_once(vae, img, lat, dtype="fp32", tiled=True, tile_px=args.tile_px, warmup=args.warmup, env={})
         record("fp32-tiled", "fp32", True, args.tile_px, {}, enc_s, dec_s)
 
