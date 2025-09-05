@@ -4,17 +4,17 @@
 # - Prints full system/GPU banner (kernel, distro, ROCm/HIP, gfx)
 # - Benchmarks encode/decode at WAN-real shapes (default 832x480, 21 frames)
 # - Runs fp32/bf16 + tiled and MIOpen toggles
+# - NEW: auto tile sweep (FP32), BF16+tiled(best), tiled+fastfind, tiled+disable-naive, with a summary table
 
 import os, sys, math, time, argparse, platform, subprocess, urllib.request, pathlib
-from typing import Dict, Tuple
+from typing import Dict, Tuple, List, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.cuda.amp as amp
 try:
     from einops import rearrange
-except Exception as e:
+except Exception:
     print("This script requires 'einops'. Install it via: pip install einops", file=sys.stderr)
     raise
 
@@ -474,16 +474,15 @@ def _video_vae(pretrained_path=None, z_dim=None, device='cpu', **kwargs):
     with torch.device('meta'):
         model = WanVAE_(**cfg)
     sd = torch.load(pretrained_path, map_location="cpu")
-    # PyTorch >=2.4 supports assign=True; fall back if not available
     try:
         model.load_state_dict(sd, assign=True)
     except TypeError:
-        model = WanVAE_(**cfg)  # re-init on CPU
+        model = WanVAE_(**cfg)
         model.load_state_dict(sd)
     return model
 
 class Wan2_1_VAE:
-    def __init__(self, z_dim=16, vae_pth=DEFAULT_VAE_PATH, dtype=torch.float, device="cuda"):
+    def __init__(self, z_dim=16, vae_pth=DEFAULT_VAE_PATH, dtype=torch.float32, device="cuda"):
         self.dtype = dtype
         self.device = device
         mean = [-0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508,
@@ -495,10 +494,11 @@ class Wan2_1_VAE:
         self.scale = [self.mean, 1.0 / self.std]
         self.model = _video_vae(pretrained_path=vae_pth, z_dim=z_dim).eval().requires_grad_(False).to(device)
     def encode(self, videos):
-        with amp.autocast(dtype=self.dtype):
+        # Use modern autocast to avoid deprecation warnings
+        with torch.amp.autocast('cuda', dtype=self.dtype):
             return [ self.model.encode(u.unsqueeze(0), self.scale).float().squeeze(0) for u in videos ]
     def decode(self, zs):
-        with amp.autocast(dtype=self.dtype):
+        with torch.amp.autocast('cuda', dtype=self.dtype):
             return [ self.model.decode(u.unsqueeze(0), self.scale).float().clamp_(-1,1).squeeze(0) for u in zs ]
 
 # -----------------------------
@@ -513,9 +513,9 @@ def pad_to_stride(t, stride_h: int, stride_w: int):
     return t
 
 def bench_encode(vae: Wan2_1_VAE, video: torch.Tensor, dtype: str, tiled: bool, tile_px: int) -> float:
-    C,F,H,W = video.shape
+    _, _, H, W = video.shape
     start = time.perf_counter()
-    ctx = torch.autocast("cuda", dtype=torch.bfloat16) if dtype == "bf16" else nullctx()
+    ctx = torch.amp.autocast('cuda', dtype=torch.bfloat16) if dtype == "bf16" else _NullCtx()
     with torch.no_grad(), ctx:
         if not tiled:
             _ = vae.encode([video])[0]
@@ -530,9 +530,9 @@ def bench_encode(vae: Wan2_1_VAE, video: torch.Tensor, dtype: str, tiled: bool, 
     return time.perf_counter() - start
 
 def bench_decode(vae: Wan2_1_VAE, latent: torch.Tensor, dtype: str, tiled: bool, latent_tile: int) -> float:
-    z,t,lh,lw = latent.shape
+    _, _, lh, lw = latent.shape
     start = time.perf_counter()
-    ctx = torch.autocast("cuda", dtype=torch.bfloat16) if dtype == "bf16" else nullctx()
+    ctx = torch.amp.autocast('cuda', dtype=torch.bfloat16) if dtype == "bf16" else _NullCtx()
     with torch.no_grad(), ctx:
         if not tiled:
             _ = vae.decode([latent])
@@ -545,9 +545,25 @@ def bench_decode(vae: Wan2_1_VAE, latent: torch.Tensor, dtype: str, tiled: bool,
     time_sync()
     return time.perf_counter() - start
 
-class nullctx:
+class _NullCtx:
     def __enter__(self): return None
     def __exit__(self, *a): return False
+
+class _EnvCtx:
+    """Temporarily set env vars for a block; restore after."""
+    def __init__(self, env: Dict[str,str]):
+        self.env = env or {}
+        self.saved: Dict[str, Optional[str]] = {}
+    def __enter__(self):
+        for k,v in self.env.items():
+            self.saved[k] = os.environ.get(k)
+            os.environ[k] = str(v)
+    def __exit__(self, *a):
+        for k,old in self.saved.items():
+            if old is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = old
 
 # -----------------------------
 # Download helper
@@ -563,6 +579,21 @@ def ensure_vae(vae_path: str):
     return vae_path
 
 # -----------------------------
+# Run one config (with warmup)
+# -----------------------------
+def run_once(vae, video, latent, *, dtype: str, tiled: bool, tile_px: int, warmup: int, env: Dict[str,str]) -> Tuple[float,float]:
+    latent_tile = max(1, tile_px // STRIDE_H)  # map pixel tiles to latent tiles
+    with _EnvCtx(env):
+        # warmup
+        for _ in range(max(0, warmup)):
+            _ = bench_encode(vae, video, dtype, tiled, tile_px)
+            _ = bench_decode(vae, latent, dtype, tiled, latent_tile)
+        # timed
+        enc_s = bench_encode(vae, video, dtype, tiled, tile_px)
+        dec_s = bench_decode(vae, latent, dtype, tiled, latent_tile)
+    return enc_s, dec_s
+
+# -----------------------------
 # Main
 # -----------------------------
 def main():
@@ -572,6 +603,7 @@ def main():
     ap.add_argument("--frames", type=int, default=21, help="Number of frames (default 21)")
     ap.add_argument("--tile_px", type=int, default=256, help="Encode tile size in pixels when tiled")
     ap.add_argument("--warmup", type=int, default=1, help="Warmup iterations per config")
+    ap.add_argument("--tile_sweep", default="256,192,128", help="Comma-separated tile sizes for auto sweep (FP32). Empty to skip.")
     args = ap.parse_args()
 
     # Size
@@ -584,7 +616,6 @@ def main():
 
     # VAE checkpoint
     vae_path = ensure_vae(args.vae_path)
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Init VAE
@@ -635,30 +666,103 @@ def main():
     print(f"  Resolution           : {W}x{H}  →  Latent: {latent.shape[3]}x{latent.shape[2]}  (h-stride={STRIDE_H}, w-stride={STRIDE_W})")
     print()
 
-    # Configs
-    CONFIGS = [
-        ("fp32-baseline",        {},                          "fp32", False),
-        ("fp32-tiled",           {},                          "fp32", True),
-        ("fp32-fastfind",        {"MIOPEN_FIND_MODE": "2"},   "fp32", False),
-        ("fp32-disable-naive",   {"MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_FWD": "0"}, "fp32", False),
-        ("bf16-baseline",        {},                          "bf16", False),
-    ]
-    latent_tile = max(1, args.tile_px // STRIDE_H)
+    # ---- Original minimal set (kept) ----
+    results = []  # list of dicts for summarizing
 
-    # Run
-    for name, envs, dtype, tiled in CONFIGS:
-        for k,v in envs.items():
-            os.environ[k] = str(v)
-        print(f"-- Test: {name}")
-        print(f"   dtype={dtype}, tiled={tiled}, env={envs or 'default'}")
-        for _ in range(max(0, args.warmup)):
-            _ = bench_encode(vae, video, dtype, tiled, args.tile_px)
-            _ = bench_decode(vae, latent, dtype, tiled, latent_tile)
-        enc_s = bench_encode(vae, video, dtype, tiled, args.tile_px)
-        dec_s = bench_decode(vae, latent, dtype, tiled, latent_tile)
+    def record(name, dtype, tiled, tile_px, env, enc_s, dec_s):
+        results.append({
+            "name": name, "dtype": dtype, "tiled": tiled, "tile_px": tile_px,
+            "env": dict(env) if env else {}, "encode_s": enc_s, "decode_s": dec_s,
+            "total_s": enc_s + dec_s
+        })
         print(f"   Encode: {enc_s:.4f}s   Decode: {dec_s:.4f}s\n")
 
-    print("Done.")
+    # 1) FP32 baseline (untiled)
+    print("-- Test: fp32-baseline")
+    print("   dtype=fp32, tiled=False, env=default")
+    enc_s, dec_s = run_once(vae, video, latent, dtype="fp32", tiled=False, tile_px=args.tile_px, warmup=args.warmup, env={})
+    record("fp32-baseline", "fp32", False, None, {}, enc_s, dec_s)
+
+    # 2) FP32 tiled (single run with user-provided tile size)
+    print("-- Test: fp32-tiled")
+    print(f"   dtype=fp32, tiled=True, env=default, tile_px={args.tile_px}")
+    enc_s, dec_s = run_once(vae, video, latent, dtype="fp32", tiled=True, tile_px=args.tile_px, warmup=args.warmup, env={})
+    record("fp32-tiled", "fp32", True, args.tile_px, {}, enc_s, dec_s)
+
+    # 3) Untiled with ROCm env toggles (fastfind / disable-naive)
+    for env_name, env_vars in [
+        ("fp32-fastfind", {"MIOPEN_FIND_MODE": "2"}),
+        ("fp32-disable-naive", {"MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_FWD": "0"}),
+    ]:
+        print(f"-- Test: {env_name}")
+        print(f"   dtype=fp32, tiled=False, env={env_vars}")
+        enc_s, dec_s = run_once(vae, video, latent, dtype="fp32", tiled=False, tile_px=args.tile_px, warmup=args.warmup, env=env_vars)
+        record(env_name, "fp32", False, None, env_vars, enc_s, dec_s)
+
+    # 4) BF16 baseline (untiled)
+    print("-- Test: bf16-baseline")
+    print("   dtype=bf16, tiled=False, env=default")
+    enc_s, dec_s = run_once(vae, video, latent, dtype="bf16", tiled=False, tile_px=args.tile_px, warmup=args.warmup, env={})
+    record("bf16-baseline", "bf16", False, None, {}, enc_s, dec_s)
+
+    # ---- NEW: Auto tile sweep (FP32 tiled) ----
+    sweep = [int(s.strip()) for s in args.tile_sweep.split(",") if s.strip().isdigit()] if args.tile_sweep else []
+    best_tile = None
+    if sweep:
+        print("-- Auto tile sweep (FP32, tiled) --------------------------------")
+        for tpx in sweep:
+            print(f"   test tile_px={tpx}")
+            enc_s, dec_s = run_once(vae, video, latent, dtype="fp32", tiled=True, tile_px=tpx, warmup=args.warmup, env={})
+            record(f"fp32-tiled-{tpx}", "fp32", True, tpx, {}, enc_s, dec_s)
+        # pick best by total time among those sweep entries
+        sweep_entries = [r for r in results if r["name"].startswith("fp32-tiled-")]
+        if sweep_entries:
+            best_entry = min(sweep_entries, key=lambda r: r["total_s"])
+            best_tile = best_entry["tile_px"]
+            print(f"   → Best tile size: {best_tile} px (total {best_entry['total_s']:.4f}s)")
+        print()
+
+    # ---- NEW: BF16 + tiled(best) ----
+    if best_tile:
+        print("-- Test: bf16-tiled(best)")
+        print(f"   dtype=bf16, tiled=True, env=default, tile_px={best_tile}")
+        enc_s, dec_s = run_once(vae, video, latent, dtype="bf16", tiled=True, tile_px=best_tile, warmup=args.warmup, env={})
+        record("bf16-tiled-best", "bf16", True, best_tile, {}, enc_s, dec_s)
+
+        # ---- NEW: Tiled + fastfind / disable-naive (sanity) ----
+        for env_name, env_vars in [
+            ("fp32-tiled-fastfind-best", {"MIOPEN_FIND_MODE": "2"}),
+            ("fp32-tiled-disable-naive-best", {"MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_FWD": "0"}),
+        ]:
+            print(f"-- Test: {env_name}")
+            print(f"   dtype=fp32, tiled=True, env={env_vars}, tile_px={best_tile}")
+            enc_s, dec_s = run_once(vae, video, latent, dtype="fp32", tiled=True, tile_px=best_tile, warmup=args.warmup, env=env_vars)
+            record(env_name, "fp32", True, best_tile, env_vars, enc_s, dec_s)
+
+    # ---- Summary table ----
+    if results:
+        print("\n== Summary (sorted by total time) ==")
+        headers = ["name","dtype","tiled","tile_px","encode_s","decode_s","total_s"]
+        widths = [max(len(h), 12) for h in headers]
+        rows = []
+        for r in sorted(results, key=lambda r: r["total_s"]):
+            rows.append([
+                r["name"],
+                r["dtype"],
+                str(r["tiled"]),
+                str(r["tile_px"]) if r["tile_px"] is not None else "-",
+                f"{r['encode_s']:.4f}",
+                f"{r['decode_s']:.4f}",
+                f"{r['total_s']:.4f}",
+            ])
+        # print header
+        line = "  ".join(h.ljust(w) for h,w in zip(headers, widths))
+        print(line)
+        print("-" * len(line))
+        for row in rows:
+            print("  ".join(s.ljust(w) for s,w in zip(row, widths)))
+
+    print("\nDone.")
     return 0
 
 if __name__ == "__main__":
