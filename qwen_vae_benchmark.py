@@ -247,7 +247,8 @@ def main():
     ap.add_argument("--preset", choices=["1664x928","1328x1328","both"], default="1664x928",
                     help="Qwen-native sizes to test (default: 1664x928)")
     ap.add_argument("--warmup", type=int, default=1, help="Warmup iterations per config (default 1)")
-    ap.add_argument("--fast", action="store_true", help="Run only fp32+tiled with --tile_px (skip baselines/sweep)")
+    ap.add_argument("--fast", action="store_true",
+                help="Run only fp32 with native tiling (skip baselines)")
     args = ap.parse_args()
 
     # Sizes
@@ -310,20 +311,24 @@ def main():
 
         # Results collector
         results = []
-        def record(name, dtype, tiled, tile_px, env, enc_s, dec_s):
+        def record(name, dtype, tiled, env, enc_s, dec_s):
             results.append({
-                "name": name, "dtype": dtype, "tiled": tiled, "tile_px": tile_px,
-                "env": dict(env) if env else {}, "encode_s": enc_s, "decode_s": dec_s,
-                "total_s": enc_s + dec_s
+                "name": name,
+                "dtype": dtype,
+                "tiled": tiled,
+                "env": dict(env) if env else {},
+                "encode_s": enc_s,
+                "decode_s": dec_s,
+                "total_s": enc_s + dec_s,
             })
             print(f"   Encode: {enc_s:.4f}s   Decode: {dec_s:.4f}s\n")
 
         # FAST MODE
         if args.fast:
             print("-- FAST MODE: fp32+tiled only --")
-            print(f"   dtype=fp32, tiled=native, env=default, tile_px=auto")
+            print(f"   dtype=fp32, tiled=native, env=default")
             enc_s, dec_s = run_once(vae, img, lat, dtype="fp32", tiled=True, warmup=args.warmup, env={})
-            record("fp32-tiled-fast", "fp32", True, "auto", {}, enc_s, dec_s)
+            record("fp32-tiled-fast", "fp32", True, {}, enc_s, dec_s)
             _print_summary(results)
             continue
 
@@ -331,12 +336,12 @@ def main():
         print("-- Test: fp32-baseline")
         print("   dtype=fp32, tiled=False, env=default")
         enc_s, dec_s = run_once(vae, img, lat, dtype="fp32", tiled=False, warmup=args.warmup, env={})
-        record("fp32-baseline", "fp32", False, None, {}, enc_s, dec_s)
+        record("fp32-baseline", "fp32", False, {}, enc_s, dec_s)
 
         print("-- Test: bf16-baseline")
         print("   dtype=bf16, tiled=False, env=default")
         enc_s, dec_s = run_once(vae, img, lat, dtype="bf16", tiled=False, warmup=args.warmup, env={})
-        record("bf16-baseline", "bf16", False, None, {}, enc_s, dec_s)
+        record("bf16-baseline", "bf16", False, {}, enc_s, dec_s)
 
         # Untiled with MIOpen env toggles
         for env_name, env_vars in [
@@ -346,47 +351,29 @@ def main():
             print(f"-- Test: {env_name}")
             print(f"   dtype=fp32, tiled=False, env={env_vars}")
             enc_s, dec_s = run_once(vae, img, lat, dtype="fp32", tiled=False, warmup=args.warmup, env=env_vars)
-            record(env_name, "fp32", False, None, env_vars, enc_s, dec_s)
+            record(env_name, "fp32", False, env_vars, enc_s, dec_s)
 
         # Single tiled run (user tile)
         print("-- Test: fp32-tiled")
         print(f"   dtype=fp32, tiled=native, env=default, tile_px=auto")
         enc_s, dec_s = run_once(vae, img, lat, dtype="fp32", tiled=True, warmup=args.warmup, env={})
-        record("fp32-tiled", "fp32", True, "auto", {}, enc_s, dec_s)
+        record("fp32-tiled", "fp32", True, {}, enc_s, dec_s)
 
+        # bf16 + native tiled
+        print("-- Test: bf16-tiled")
+        print("   dtype=bf16, tiled=native, env=default")
+        enc_s, dec_s = run_once(vae, img, lat, dtype="bf16", tiled=True, warmup=args.warmup, env={})
+        record("bf16-tiled", "bf16", True, {}, enc_s, dec_s)
 
-        # Auto tile sweep (fp32, tiled)
-        sweep = [int(s.strip()) for s in args.tile_sweep.split(",") if s.strip().isdigit()] if args.tile_sweep else []
-        best_tile = None
-        if sweep:
-            print("-- Auto tile sweep (FP32, tiled) --------------------------------")
-            for tpx in sweep:
-                print(f"   test tile_px={tpx}")
-                enc_s, dec_s = run_once(vae, img, lat, dtype="fp32", tiled=True, tile_px=tpx, warmup=args.warmup, env={})
-                record(f"fp32-tiled-{tpx}", "fp32", True, tpx, {}, enc_s, dec_s)
-            sweep_entries = [r for r in results if r["name"].startswith("fp32-tiled-")]
-            if sweep_entries:
-                best_entry = min(sweep_entries, key=lambda r: r["total_s"])
-                best_tile = best_entry["tile_px"]
-                print(f"   → Best tile size: {best_tile} px (total {best_entry['total_s']:.4f}s)")
-            print()
-
-        # bf16 + tiled(best)
-        if best_tile:
-            print("-- Test: bf16-tiled(best)")
-            print(f"   dtype=bf16, tiled=True, env=default, tile_px={best_tile}")
-            enc_s, dec_s = run_once(vae, img, lat, dtype="bf16", tiled=True, tile_px=best_tile, warmup=args.warmup, env={})
-            record("bf16-tiled-best", "bf16", True, best_tile, {}, enc_s, dec_s)
-
-            # tiled + env sanity
-            for env_name, env_vars in [
-                ("fp32-tiled-fastfind-best", {"MIOPEN_FIND_MODE": "2"}),
-                ("fp32-tiled-disable-naive-best", {"MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_FWD": "0"}),
-            ]:
-                print(f"-- Test: {env_name}")
-                print(f"   dtype=fp32, tiled=native, env={env_vars}, tile_px=auto")
-                enc_s, dec_s = run_once(vae, img, lat, dtype="fp32", tiled=True, tile_px=0, warmup=args.warmup, env=env_vars)
-                record(env_name, "fp32", True, "auto", env_vars, enc_s, dec_s)
+        # tiled + env sanity (native tiling)
+        for env_name, env_vars in [
+            ("fp32-tiled-fastfind", {"MIOPEN_FIND_MODE": "2"}),
+            ("fp32-tiled-disable-naive", {"MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_FWD": "0"}),
+        ]:
+            print(f"-- Test: {env_name}")
+            print(f"   dtype=fp32, tiled=native, env={env_vars}")
+            enc_s, dec_s = run_once(vae, img, lat, dtype="fp32", tiled=True, warmup=args.warmup, env=env_vars)
+            record(env_name, "fp32", True, env_vars, enc_s, dec_s)
 
         _print_summary(results)
 
