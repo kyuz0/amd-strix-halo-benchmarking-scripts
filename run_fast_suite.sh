@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Fast VAE benchmark sweep (fp32 + tiled only) for WAN on ROCm/Strix Halo
 # - Runs with and without warmup
-# - Covers WAN default res (832x480) and 720p (both orientations)
+# - Covers WAN default res (832x480) and 720p horizontal (720x1280)
 # - Prints each command before executing
 #
 # Usage:
@@ -32,7 +32,6 @@ echo
 # Sizes and frame counts to test
 SIZES=(
   "832*480"     # WAN default
-  "1280*720"    # 720p vertical
   "720*1280"    # 720p horizontal
 )
 
