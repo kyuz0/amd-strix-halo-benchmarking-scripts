@@ -13,7 +13,7 @@ import torch
 import torch.nn.functional as F
 
 try:
-    from diffusers import AutoencoderKL
+    from diffusers import AutoencoderKLQwenImage
 except Exception:
     print("This script requires 'diffusers'. Install it via: pip install diffusers", file=sys.stderr)
     raise
@@ -131,7 +131,7 @@ class QwenVAE:
         self.device = torch.device(device)
         self.dtype  = dtype
         # Download/load from Hugging Face
-        self.vae: AutoencoderKL = AutoencoderKL.from_pretrained(
+        self.vae: AutoencoderKLQwenImage = AutoencoderKLQwenImage.from_pretrained(
             "Qwen/Qwen-Image", subfolder="vae", torch_dtype=torch.float32
         ).to(self.device)
         self.vae.eval()
