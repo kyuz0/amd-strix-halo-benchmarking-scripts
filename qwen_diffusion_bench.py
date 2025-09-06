@@ -316,4 +316,41 @@ def worker(args):
 
     agg_avg = sum(r["avg_s"] for r in results) / len(results)
     agg_p50 = sorted([r["p50_s"] for r in results])[len(results)//2]
-    agg_p90 = sorted([r["p]()]()_
+    agg_p90 = sorted([r["p90_s"] for r in results])[max(0,int(len(results)*0.9)-1)]
+    W,H,batch,aspect,mode = results[0]["W"],results[0]["H"],results[0]["batch"],results[0]["aspect"],results[0]["mode"]
+
+    log("----------------------------------------------------------------")
+    log(f"[worker summary] avg={agg_avg:.3f}s  p50={agg_p50:.3f}s  p90={agg_p90:.3f}s")
+    log("----------------------------------------------------------------")
+
+    print(json.dumps(dict(
+        avg_s=agg_avg, p50_s=agg_p50, p90_s=agg_p90,
+        W=W, H=H, batch=batch, aspect=aspect, mode=mode
+    )))
+
+# ---------------- Args ----------------
+
+def build_parser():
+    ap = argparse.ArgumentParser(description="Qwen-Image one-command ROCm bench (verbose, FA backends)")
+    # orchestrator options
+    ap.add_argument("--auto-dtypes", default="bf16", help="comma list among: bf16,fp16")
+    ap.add_argument("--aspects", default="16:9")
+    ap.add_argument("--batches", default="1")
+    ap.add_argument("--base", type=int, default=1024)
+    ap.add_argument("--mode", choices=["gen","edit","both"], default="gen")
+    ap.add_argument("--steps", type=int, default=1)
+    # worker-only
+    ap.add_argument("--worker", action="store_true")
+    ap.add_argument("--worker-attn", default="flash")      # flash or math
+    ap.add_argument("--worker-fa", default="aotriton")     # aotriton or ck
+    ap.add_argument("--worker-mem-mb", type=int, default=2048)
+    ap.add_argument("--worker-dtype", default="bf16")
+    return ap
+
+if __name__ == "__main__":
+    parser = build_parser()
+    args = parser.parse_args()
+    if args.worker:
+        worker(args)
+    else:
+        orchestrate(args)
