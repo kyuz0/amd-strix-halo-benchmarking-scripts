@@ -1,0 +1,350 @@
+#!/usr/bin/env python3
+# Qwen-Image ONE-COMMAND denoising bench (ROCm, verbose)
+# - Tries a tiny, proven grid: attn {sdpa, math} × ROCBLAS mem {1024, 2048} MB × dtype {bf16[, fp16]}
+# - Verbose by default: prints env, loads, shapes, warmup, timings
+# - Orchestrator spawns a worker subprocess per config so ROCm envs actually change
+#
+# Examples:
+#   python qwen_denoise_bench.py
+#   python qwen_denoise_bench.py --auto-dtypes bf16,fp16 --aspects 16:9 --batches 1,2
+
+import os, sys, argparse, subprocess, json, time, math
+from itertools import product
+from contextlib import nullcontext
+
+# ---------------- Orchestrator ----------------
+
+def parse_list_int(s): return [int(x) for x in s.split(",") if x.strip()]
+def parse_list_str(s): return [x.strip() for x in s.split(",") if x.strip()]
+
+def orchestrate(args):
+    attns   = ["sdpa","math"]
+    mems_mb = [1024, 2048]
+    dtypes  = parse_list_str(args.auto_dtypes)
+
+    combos = list(product(attns, mems_mb, dtypes))
+    total  = len(combos)
+    results = []
+
+    print("\n=== Qwen-Image ONE-COMMAND Bench (verbose) ===")
+    print(f"Search grid: attn={attns}  rocblas_mem_mb={mems_mb}  dtypes={dtypes}")
+    print(f"Global test params: aspects={args.aspects}  batches={args.batches}  base={args.base}  mode={args.mode}  steps={args.steps}")
+    print("================================================\n")
+
+    for idx, (attn, mem_mb, dt) in enumerate(combos, 1):
+        print(f">>> [{idx}/{total}] Launching worker: attn={attn}, ROCBLAS_DEVICE_MEMORY_SIZE={mem_mb}MB, dtype={dt}")
+        env = os.environ.copy()
+        env["TORCH_BLAS_PREFER_HIPBLASLT"] = "1"
+        env["ROCBLAS_DEVICE_MEMORY_SIZE"]  = str(mem_mb * 1024 * 1024)
+        env["PYTORCH_TUNABLEOP_ENABLED"]   = "1"   # reuse (no tuning pass)
+        env["PYTORCH_TUNABLEOP_TUNING"]    = "0"
+        env["PYTORCH_TUNABLEOP_VERBOSE"]   = "0"
+
+        cmd = [sys.executable, sys.argv[0],
+               "--worker",
+               "--worker-attn", attn,
+               "--worker-mem-mb", str(mem_mb),
+               "--worker-dtype", dt,
+               "--mode", args.mode,
+               "--base", str(args.base),
+               "--aspects", args.aspects,
+               "--batches", args.batches,
+               "--steps", str(args.steps)]
+        t0 = time.perf_counter()
+        p = subprocess.run(cmd, env=env, capture_output=True, text=True)
+        dur = time.perf_counter() - t0
+
+        # echo worker logs (stderr) verbosely
+        if p.stderr:
+            print(p.stderr, end="")
+
+        if p.returncode != 0:
+            print(f"[worker ERROR] attn={attn} mem={mem_mb}MB dtype={dt} (exit {p.returncode})")
+            continue
+
+        # parse final JSON line from stdout
+        rec = None
+        for line in reversed(p.stdout.strip().splitlines()):
+            line = line.strip()
+            if line.startswith("{") and line.endswith("}"):
+                try:
+                    rec = json.loads(line)
+                    break
+                except Exception:
+                    pass
+        if rec is None:
+            print(f"[worker PARSE ERROR] stdout had no JSON line.\nSTDOUT:\n{p.stdout}")
+            continue
+
+        rec.update(dict(attn=attn, rocblas_mem_mb=mem_mb, dtype=dt, wall_s=dur))
+        results.append(rec)
+        print(f"<<< [{idx}/{total}] Done: avg_s={rec['avg_s']:.3f}s  (wall {dur:.1f}s)\n")
+
+    if not results:
+        print("No successful runs.")
+        sys.exit(1)
+
+    results.sort(key=lambda r: r["avg_s"])
+    best = results[0]
+
+    print("\n==================== BEST CONFIG ====================")
+    print(f"avg_s={best['avg_s']:.3f}s  p50={best['p50_s']:.3f}s  p90={best['p90_s']:.3f}s")
+    print(f"attn={best['attn']}  dtype={best['dtype']}  ROCBLAS_DEVICE_MEMORY_SIZE={best['rocblas_mem_mb']}MB")
+    print("Reproduce env:")
+    print("  TORCH_BLAS_PREFER_HIPBLASLT=1")
+    print(f"  ROCBLAS_DEVICE_MEMORY_SIZE={best['rocblas_mem_mb']*1024*1024}")
+    print("  PYTORCH_TUNABLEOP_ENABLED=1  PYTORCH_TUNABLEOP_TUNING=0  PYTORCH_TUNABLEOP_VERBOSE=0")
+    print("=====================================================\n")
+
+    # summary table
+    headers = ["rank","avg_s","p50_s","p90_s","attn","dtype","rocblas_mem_mb","W","H","batch","aspect","mode","wall_s"]
+    print("== Summary (sorted by avg_s) ==")
+    print("  ".join(h.ljust(10) for h in headers))
+    print("-"*len("  ".join(h.ljust(10) for h in headers)))
+    for i, r in enumerate(results, 1):
+        print("  ".join([
+            str(i).ljust(10),
+            f"{r['avg_s']:.3f}".ljust(10),
+            f"{r['p50_s']:.3f}".ljust(10),
+            f"{r['p90_s']:.3f}".ljust(10),
+            r["attn"].ljust(10),
+            r["dtype"].ljust(10),
+            str(r["rocblas_mem_mb"]).ljust(10),
+            str(r["W"]).ljust(10),
+            str(r["H"]).ljust(10),
+            str(r["batch"]).ljust(10),
+            r["aspect"].ljust(10),
+            r["mode"].ljust(10),
+            f"{r['wall_s']:.1f}".ljust(10),
+        ]))
+
+# ---------------- Worker (single config; prints verbosely to STDERR) ----------------
+
+def worker(args):
+    import torch
+    from diffusers import QwenImagePipeline, QwenImageEditPipeline
+
+    def log(msg): print(msg, file=sys.stderr, flush=True)
+
+    def pick_device():
+        return "cuda" if (hasattr(torch, "cuda") and torch.cuda.is_available()) else "cpu"
+
+    def parse_aspect(s):
+        w, h = s.split(":"); return int(w), int(h)
+
+    def pack_latents(latents, b, nc, h, w):
+        x = latents.view(b, nc, h // 2, 2, w // 2, 2)
+        x = x.permute(0, 2, 4, 1, 3, 5).contiguous()
+        return x.reshape(b, (h // 2) * (w // 2), nc * 4)
+
+    def compute_dims(base_px, aspect_wh, vae_scale=8):
+        aw, ah = aspect_wh
+        ratio = aw / ah
+        w = int(round(math.sqrt(base_px * ratio) / 32) * 32)
+        h = int(round(w / ratio / 32) * 32)
+        mult = vae_scale * 2
+        w = (w // mult) * mult; h = (h // mult) * mult
+        H = 2 * (int(h) // (vae_scale * 2))
+        W = 2 * (int(w) // (vae_scale * 2))
+        return w, h, H, W
+
+    def set_attention_backend(module, name):
+        name = name.lower()
+        try:
+            from diffusers.models.attention_processor import AttnProcessor, AttnProcessor2_0
+        except Exception:
+            AttnProcessor = AttnProcessor2_0 = None
+        if name in ("sdpa","attn2","attn_2_0"):
+            if hasattr(module,"set_attn_processor") and AttnProcessor2_0 is not None:
+                try: module.set_attn_processor(AttnProcessor2_0()); return "sdpa"
+                except Exception as e: pass
+            if hasattr(module,"enable_sdpa"):
+                try: module.enable_sdpa(); return "sdpa"
+                except Exception: pass
+            return "default"
+        if name in ("math","default"):
+            if hasattr(module,"set_attn_processor") and AttnProcessor is not None:
+                try: module.set_attn_processor(AttnProcessor()); return "math"
+                except Exception: pass
+            return "default"
+        return "default"
+
+    def sdpa_ctx(kind):
+        try:
+            from torch.nn.attention import sdpa_kernel, SDPBackend
+            if kind == "sdpa":
+                return sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH], set_priority=True)
+            if kind == "math":
+                return sdpa_kernel([SDPBackend.MATH], set_priority=True)
+        except Exception:
+            pass
+        return nullcontext()
+
+    @torch.no_grad()
+    def timed_forward(pipe, sdpa_kind, synth):
+        kwargs = dict(
+            hidden_states=synth["latent_model_input"],
+            timestep=synth["timestep"],
+            guidance=None,
+            encoder_hidden_states_mask=synth["prompt_mask"],
+            encoder_hidden_states=synth["prompt_embeds"],
+            img_shapes=synth["img_shapes"],
+            txt_seq_lens=synth["txt_seq_lens"],
+            attention_kwargs={},
+            return_dict=False,
+        )
+        if torch.cuda.is_available(): torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        with sdpa_ctx(sdpa_kind):
+            out = pipe.transformer(**kwargs)[0]
+        if torch.cuda.is_available(): torch.cuda.synchronize()
+        return time.perf_counter() - t0, out
+
+    def build_synth_inputs(pipe, mode, bs, w, h, H, W, dtype):
+        in_ch = int(pipe.transformer.config.in_channels)
+        lat_ch = in_ch // 4
+        embed_dim = int(getattr(pipe.transformer.config, "cross_attention_dim", 3584))
+        seq_len = 6
+        device = next(pipe.transformer.parameters()).device
+        lat = torch.randn(bs, 1, lat_ch, H, W, device=device, dtype=dtype)
+        latents = pack_latents(lat, bs, lat_ch, H, W)
+        prompt_embeds = torch.randn(bs, seq_len, embed_dim, device=device, dtype=dtype)
+        prompt_mask   = torch.ones(bs, seq_len, device=device, dtype=torch.long)
+        if mode == "edit":
+            image_latents = torch.randn_like(latents)
+            img_shapes = [[(1, H//2, W//2), (1, H//2, W//2)]] * bs
+            latent_model_input = torch.cat([latents, image_latents], dim=1)
+        else:
+            img_shapes = [[(1, H//2, W//2)]] * bs
+            latent_model_input = latents
+        t = torch.tensor([1000.0], device=device, dtype=dtype).expand(bs)
+        return dict(
+            latent_model_input=latent_model_input,
+            timestep=t/1000.0,
+            prompt_embeds=prompt_embeds,
+            prompt_mask=prompt_mask,
+            img_shapes=img_shapes,
+            txt_seq_lens=prompt_mask.sum(dim=1).tolist(),
+        )
+
+    import platform, math, time
+    device = pick_device()
+    torch.set_default_device(device)
+
+    # header + env
+    log("----------------------------------------------------------------")
+    log("Worker starting...")
+    log(f"PyTorch: {torch.__version__}  HIP: {getattr(torch.version,'hip',None)}")
+    log(f"Device : {device} ({torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'})")
+    log(f"Kernel : {platform.release()}")
+    log("Env    : " +
+        f"TORCH_BLAS_PREFER_HIPBLASLT={os.environ.get('TORCH_BLAS_PREFER_HIPBLASLT')}  " +
+        f"ROCBLAS_DEVICE_MEMORY_SIZE={os.environ.get('ROCBLAS_DEVICE_MEMORY_SIZE')}  " +
+        f"PYTORCH_TUNABLEOP_ENABLED={os.environ.get('PYTORCH_TUNABLEOP_ENABLED')}  " +
+        f"TUNING={os.environ.get('PYTORCH_TUNABLEOP_TUNING')}")
+    log(f"Config : attn={args.worker_attn}  dtype={args.worker_dtype}  aspects={args.aspects}  batches={args.batches}  base={args.base}  mode={args.mode}  steps={args.steps}")
+    log("----------------------------------------------------------------")
+
+    # dtype
+    if args.worker_dtype == "bf16": dtype = torch.bfloat16
+    elif args.worker_dtype in ("fp16","half"): dtype = torch.float16
+    else: dtype = torch.bfloat16
+
+    # load once per mode
+    modes = ["gen","edit"] if args.mode == "both" else [args.mode]
+    from diffusers import QwenImagePipeline, QwenImageEditPipeline
+
+    results = []
+    for mode in modes:
+        model_id = "Qwen/Qwen-Image" if mode == "gen" else "Qwen/Qwen-Image-Edit"
+        cls = QwenImagePipeline if mode == "gen" else QwenImageEditPipeline
+        t0 = time.perf_counter()
+        # IMPORTANT: use torch_dtype, not dtype
+        pipe = cls.from_pretrained(model_id, torch_dtype=dtype)
+        load_s = time.perf_counter() - t0
+        pipe.to(device)
+        # hard-cast the transformer just in case some submodules are still float32
+        pipe.transformer.to(dtype=dtype)
+        pipe.transformer.eval()
+
+        # (optional) sanity print so you can see it's uniform now
+        uniq_dtypes = {p.dtype for p in pipe.transformer.parameters() if p.dtype.is_floating_point}
+        print(f"[dtype] transformer param dtypes: {sorted(str(d) for d in uniq_dtypes)}", file=sys.stderr, flush=True)
+
+        log(f"[load] done in {load_s:.2f}s  in_channels={int(pipe.transformer.config.in_channels)}")
+
+        # attn + sdpa choice
+        eff_attn = set_attention_backend(pipe.transformer, args.worker_attn)
+        sdpa_kind = "sdpa" if eff_attn == "sdpa" else "math"
+        log(f"[attn] requested={args.worker_attn}  effective={eff_attn}/{sdpa_kind}")
+
+        aspects = [tuple(map(int, a.split(":"))) for a in args.aspects.split(",") if a]
+        batches = [int(x) for x in args.batches.split(",") if x]
+
+        for aspect in aspects:
+            W, H, Hp, Wp = compute_dims(args.base*args.base, aspect, getattr(pipe, "vae_scale_factor", 8))
+            for bs in batches:
+                log(f"[shape] aspect={aspect[0]}:{aspect[1]}  W={W} H={H}  packed(H/2={Hp//2}, W/2={Wp//2})  batch={bs}")
+                synth = build_synth_inputs(pipe, mode, bs, W, H, Hp, Wp, dtype)
+                # warmup
+                ws, _ = timed_forward(pipe, sdpa_kind, synth)
+                log(f"[warmup] {ws:.3f}s")
+                # timed
+                per = []
+                for i in range(args.steps):
+                    s, _ = timed_forward(pipe, sdpa_kind, synth)
+                    per.append(s)
+                    log(f"[step {i+1}/{args.steps}] {s:.3f}s")
+                avg = sum(per)/len(per)
+                p50 = sorted(per)[len(per)//2]
+                p90 = sorted(per)[max(0,int(len(per)*0.9)-1)]
+                log(f"[result] avg={avg:.3f}s p50={p50:.3f}s p90={p90:.3f}s\n")
+                results.append(dict(
+                    mode=mode, W=W, H=H, batch=bs, aspect=f"{aspect[0]}:{aspect[1]}",
+                    avg_s=avg, p50_s=p50, p90_s=p90
+                ))
+
+        del pipe
+        if torch.cuda.is_available(): torch.cuda.empty_cache()
+
+    # aggregate for this worker
+    agg_avg = sum(r["avg_s"] for r in results) / len(results)
+    agg_p50 = sorted([r["p50_s"] for r in results])[len(results)//2]
+    agg_p90 = sorted([r["p90_s"] for r in results])[max(0,int(len(results)*0.9)-1)]
+    W,H,batch,aspect,mode = results[0]["W"],results[0]["H"],results[0]["batch"],results[0]["aspect"],results[0]["mode"]
+
+    log("----------------------------------------------------------------")
+    log(f"[worker summary] avg={agg_avg:.3f}s  p50={agg_p50:.3f}s  p90={agg_p90:.3f}s")
+    log("----------------------------------------------------------------")
+
+    # final JSON to STDOUT (orchestrator parses this)
+    print(json.dumps(dict(
+        avg_s=agg_avg, p50_s=agg_p50, p90_s=agg_p90,
+        W=W, H=H, batch=batch, aspect=aspect, mode=mode
+    )))
+
+# ---------------- Args ----------------
+
+def build_parser():
+    ap = argparse.ArgumentParser(description="Qwen-Image one-command ROCm bench (verbose)")
+    # orchestrator options
+    ap.add_argument("--auto-dtypes", default="bf16", help="comma list among: bf16,fp16")
+    ap.add_argument("--aspects", default="16:9")
+    ap.add_argument("--batches", default="1")
+    ap.add_argument("--base", type=int, default=1024)
+    ap.add_argument("--mode", choices=["gen","edit","both"], default="gen")
+    ap.add_argument("--steps", type=int, default=1)
+    # worker-only
+    ap.add_argument("--worker", action="store_true")
+    ap.add_argument("--worker-attn", default="sdpa")
+    ap.add_argument("--worker-mem-mb", type=int, default=2048)
+    ap.add_argument("--worker-dtype", default="bf16")
+    return ap
+
+if __name__ == "__main__":
+    parser = build_parser()
+    args = parser.parse_args()
+    if args.worker:
+        worker(args)
+    else:
+        orchestrate(args)
