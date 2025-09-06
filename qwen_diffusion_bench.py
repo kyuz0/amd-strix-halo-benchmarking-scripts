@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-# Qwen-Image ONE-COMMAND denoising bench (ROCm, verbose)
-# - Tries a tiny, proven grid: attn {sdpa, math} × ROCBLAS mem {1024, 2048} MB × dtype {bf16[, fp16]}
-# - Verbose by default: prints env, loads, shapes, warmup, timings
-# - Orchestrator spawns a worker subprocess per config so ROCm envs actually change
+# Qwen-Image ONE-COMMAND denoising bench (ROCm, verbose, AOTriton/CK)
+# - No hipBLASLt anywhere (removed).
+# - Compares attention:
+#     * "flash" with FA backend = {aotriton, ck}
+#     * "math" (no SDPA)
+# - Also sweeps ROCBLAS_DEVICE_MEMORY_SIZE {1024, 2048} MB for linear layers.
+# - Verbose: prints env, loads, shapes, warmup, timings.
 #
 # Examples:
 #   python qwen_denoise_bench.py
@@ -14,35 +17,38 @@ from contextlib import nullcontext
 
 # ---------------- Orchestrator ----------------
 
-def parse_list_int(s): return [int(x) for x in s.split(",") if x.strip()]
 def parse_list_str(s): return [x.strip() for x in s.split(",") if x.strip()]
 
 def orchestrate(args):
-    attns   = ["sdpa","math"]
-    mems_mb = [1024, 2048]
-    dtypes  = parse_list_str(args.auto_dtypes)
+    attns       = ["flash", "math"]          # "flash" hits SDPA FlashAttention; "math" is non-SDPA
+    fa_backends = ["aotriton", "ck"]         # preferred FlashAttention backend (ROCm)
+    mems_mb     = [1024, 2048]
+    dtypes      = parse_list_str(args.auto_dtypes)
 
-    combos = list(product(attns, mems_mb, dtypes))
+    combos = list(product(attns, fa_backends, mems_mb, dtypes))
     total  = len(combos)
     results = []
 
     print("\n=== Qwen-Image ONE-COMMAND Bench (verbose) ===")
-    print(f"Search grid: attn={attns}  rocblas_mem_mb={mems_mb}  dtypes={dtypes}")
+    print(f"Search grid: attn={attns}  fa_backends={fa_backends}  rocblas_mem_mb={mems_mb}  dtypes={dtypes}")
     print(f"Global test params: aspects={args.aspects}  batches={args.batches}  base={args.base}  mode={args.mode}  steps={args.steps}")
     print("================================================\n")
 
-    for idx, (attn, mem_mb, dt) in enumerate(combos, 1):
-        print(f">>> [{idx}/{total}] Launching worker: attn={attn}, ROCBLAS_DEVICE_MEMORY_SIZE={mem_mb}MB, dtype={dt}")
+    for idx, (attn, fa, mem_mb, dt) in enumerate(combos, 1):
+        print(f">>> [{idx}/{total}] Launching worker: attn={attn}, FA={fa}, ROCBLAS_DEVICE_MEMORY_SIZE={mem_mb}MB, dtype={dt}")
         env = os.environ.copy()
-        env["TORCH_BLAS_PREFER_HIPBLASLT"] = "1"
-        env["ROCBLAS_DEVICE_MEMORY_SIZE"]  = str(mem_mb * 1024 * 1024)
-        env["PYTORCH_TUNABLEOP_ENABLED"]   = "1"   # reuse (no tuning pass)
-        env["PYTORCH_TUNABLEOP_TUNING"]    = "0"
-        env["PYTORCH_TUNABLEOP_VERBOSE"]   = "0"
+        # No hipBLASLt knobs at all.
+        env["ROCBLAS_DEVICE_MEMORY_SIZE"] = str(mem_mb * 1024 * 1024)
+        # Prefer CK only when requested; default is AOTriton
+        if fa == "ck":
+            env["TORCH_ROCM_FA_PREFER_CK"] = "1"
+        else:
+            env.pop("TORCH_ROCM_FA_PREFER_CK", None)
 
         cmd = [sys.executable, sys.argv[0],
                "--worker",
                "--worker-attn", attn,
+               "--worker-fa", fa,
                "--worker-mem-mb", str(mem_mb),
                "--worker-dtype", dt,
                "--mode", args.mode,
@@ -54,15 +60,13 @@ def orchestrate(args):
         p = subprocess.run(cmd, env=env, capture_output=True, text=True)
         dur = time.perf_counter() - t0
 
-        # echo worker logs (stderr) verbosely
-        if p.stderr:
+        if p.stderr:  # echo worker logs
             print(p.stderr, end="")
 
         if p.returncode != 0:
-            print(f"[worker ERROR] attn={attn} mem={mem_mb}MB dtype={dt} (exit {p.returncode})")
+            print(f"[worker ERROR] attn={attn} fa={fa} mem={mem_mb}MB dtype={dt} (exit {p.returncode})")
             continue
 
-        # parse final JSON line from stdout
         rec = None
         for line in reversed(p.stdout.strip().splitlines()):
             line = line.strip()
@@ -76,7 +80,7 @@ def orchestrate(args):
             print(f"[worker PARSE ERROR] stdout had no JSON line.\nSTDOUT:\n{p.stdout}")
             continue
 
-        rec.update(dict(attn=attn, rocblas_mem_mb=mem_mb, dtype=dt, wall_s=dur))
+        rec.update(dict(attn=attn, fa=fa, rocblas_mem_mb=mem_mb, dtype=dt, wall_s=dur))
         results.append(rec)
         print(f"<<< [{idx}/{total}] Done: avg_s={rec['avg_s']:.3f}s  (wall {dur:.1f}s)\n")
 
@@ -89,15 +93,14 @@ def orchestrate(args):
 
     print("\n==================== BEST CONFIG ====================")
     print(f"avg_s={best['avg_s']:.3f}s  p50={best['p50_s']:.3f}s  p90={best['p90_s']:.3f}s")
-    print(f"attn={best['attn']}  dtype={best['dtype']}  ROCBLAS_DEVICE_MEMORY_SIZE={best['rocblas_mem_mb']}MB")
+    print(f"attn={best['attn']}  FA={best['fa']}  dtype={best['dtype']}  ROCBLAS_DEVICE_MEMORY_SIZE={best['rocblas_mem_mb']}MB")
     print("Reproduce env:")
-    print("  TORCH_BLAS_PREFER_HIPBLASLT=1")
     print(f"  ROCBLAS_DEVICE_MEMORY_SIZE={best['rocblas_mem_mb']*1024*1024}")
-    print("  PYTORCH_TUNABLEOP_ENABLED=1  PYTORCH_TUNABLEOP_TUNING=0  PYTORCH_TUNABLEOP_VERBOSE=0")
+    if best["fa"] == "ck":
+        print("  TORCH_ROCM_FA_PREFER_CK=1")
     print("=====================================================\n")
 
-    # summary table
-    headers = ["rank","avg_s","p50_s","p90_s","attn","dtype","rocblas_mem_mb","W","H","batch","aspect","mode","wall_s"]
+    headers = ["rank","avg_s","p50_s","p90_s","attn","fa","dtype","rocblas_mem_mb","W","H","batch","aspect","mode","wall_s"]
     print("== Summary (sorted by avg_s) ==")
     print("  ".join(h.ljust(10) for h in headers))
     print("-"*len("  ".join(h.ljust(10) for h in headers)))
@@ -108,6 +111,7 @@ def orchestrate(args):
             f"{r['p50_s']:.3f}".ljust(10),
             f"{r['p90_s']:.3f}".ljust(10),
             r["attn"].ljust(10),
+            r["fa"].ljust(10),
             r["dtype"].ljust(10),
             str(r["rocblas_mem_mb"]).ljust(10),
             str(r["W"]).ljust(10),
@@ -154,10 +158,10 @@ def worker(args):
             from diffusers.models.attention_processor import AttnProcessor, AttnProcessor2_0
         except Exception:
             AttnProcessor = AttnProcessor2_0 = None
-        if name in ("sdpa","attn2","attn_2_0"):
+        if name in ("flash","sdpa","attn2","attn_2_0"):
             if hasattr(module,"set_attn_processor") and AttnProcessor2_0 is not None:
                 try: module.set_attn_processor(AttnProcessor2_0()); return "sdpa"
-                except Exception as e: pass
+                except Exception: pass
             if hasattr(module,"enable_sdpa"):
                 try: module.enable_sdpa(); return "sdpa"
                 except Exception: pass
@@ -172,7 +176,10 @@ def worker(args):
     def sdpa_ctx(kind):
         try:
             from torch.nn.attention import sdpa_kernel, SDPBackend
-            if kind == "sdpa":
+            if kind == "flash":
+                # FlashAttention (AOTriton/CK) first; fall back to math if unavailable
+                return sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.MATH], set_priority=True)
+            if kind == "sdpa":  # not used directly, but kept for completeness
                 return sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH], set_priority=True)
             if kind == "math":
                 return sdpa_kernel([SDPBackend.MATH], set_priority=True)
@@ -227,22 +234,19 @@ def worker(args):
             txt_seq_lens=prompt_mask.sum(dim=1).tolist(),
         )
 
-    import platform, math, time
+    import platform, time
     device = pick_device()
     torch.set_default_device(device)
 
     # header + env
+    print_env = f"ROCBLAS_DEVICE_MEMORY_SIZE={os.environ.get('ROCBLAS_DEVICE_MEMORY_SIZE')}  TORCH_ROCM_FA_PREFER_CK={os.environ.get('TORCH_ROCM_FA_PREFER_CK')}"
     log("----------------------------------------------------------------")
     log("Worker starting...")
     log(f"PyTorch: {torch.__version__}  HIP: {getattr(torch.version,'hip',None)}")
     log(f"Device : {device} ({torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'})")
     log(f"Kernel : {platform.release()}")
-    log("Env    : " +
-        f"TORCH_BLAS_PREFER_HIPBLASLT={os.environ.get('TORCH_BLAS_PREFER_HIPBLASLT')}  " +
-        f"ROCBLAS_DEVICE_MEMORY_SIZE={os.environ.get('ROCBLAS_DEVICE_MEMORY_SIZE')}  " +
-        f"PYTORCH_TUNABLEOP_ENABLED={os.environ.get('PYTORCH_TUNABLEOP_ENABLED')}  " +
-        f"TUNING={os.environ.get('PYTORCH_TUNABLEOP_TUNING')}")
-    log(f"Config : attn={args.worker_attn}  dtype={args.worker_dtype}  aspects={args.aspects}  batches={args.batches}  base={args.base}  mode={args.mode}  steps={args.steps}")
+    log(f"Env    : {print_env}")
+    log(f"Config : attn={args.worker_attn}  fa={args.worker_fa}  dtype={args.worker_dtype}  aspects={args.aspects}  batches={args.batches}  base={args.base}  mode={args.mode}  steps={args.steps}")
     log("----------------------------------------------------------------")
 
     # dtype
@@ -250,7 +254,15 @@ def worker(args):
     elif args.worker_dtype in ("fp16","half"): dtype = torch.float16
     else: dtype = torch.bfloat16
 
-    # load once per mode
+    # Prefer FA backend explicitly (API, if available)
+    try:
+        pref_in = "ck" if args.worker_fa == "ck" else "aotriton"
+        torch.backends.cuda.preferred_rocm_fa_library(pref_in)
+        fa_pref_out = torch.backends.cuda.preferred_rocm_fa_library()
+        log(f"[fa] preferred_rocm_fa_library set to: {fa_pref_out}")
+    except Exception as e:
+        log(f"[fa] could not set preferred_rocm_fa_library: {e}")
+
     modes = ["gen","edit"] if args.mode == "both" else [args.mode]
     from diffusers import QwenImagePipeline, QwenImageEditPipeline
 
@@ -258,25 +270,22 @@ def worker(args):
     for mode in modes:
         model_id = "Qwen/Qwen-Image" if mode == "gen" else "Qwen/Qwen-Image-Edit"
         cls = QwenImagePipeline if mode == "gen" else QwenImageEditPipeline
+        log(f"[load] mode={mode} model={model_id} dtype={dtype}")
         t0 = time.perf_counter()
-        # IMPORTANT: use torch_dtype, not dtype
+        # IMPORTANT: use torch_dtype and hard-cast the transformer
         pipe = cls.from_pretrained(model_id, torch_dtype=dtype)
         load_s = time.perf_counter() - t0
         pipe.to(device)
-        # hard-cast the transformer just in case some submodules are still float32
         pipe.transformer.to(dtype=dtype)
         pipe.transformer.eval()
-
-        # (optional) sanity print so you can see it's uniform now
         uniq_dtypes = {p.dtype for p in pipe.transformer.parameters() if p.dtype.is_floating_point}
-        print(f"[dtype] transformer param dtypes: {sorted(str(d) for d in uniq_dtypes)}", file=sys.stderr, flush=True)
-
+        log(f"[dtype] transformer param dtypes: {sorted(str(d) for d in uniq_dtypes)}")
         log(f"[load] done in {load_s:.2f}s  in_channels={int(pipe.transformer.config.in_channels)}")
 
-        # attn + sdpa choice
-        eff_attn = set_attention_backend(pipe.transformer, args.worker_attn)
-        sdpa_kind = "sdpa" if eff_attn == "sdpa" else "math"
-        log(f"[attn] requested={args.worker_attn}  effective={eff_attn}/{sdpa_kind}")
+        # attention setup
+        eff_attn = set_attention_backend(pipe.transformer, "flash" if args.worker_attn == "flash" else "math")
+        sdpa_kind = "flash" if (args.worker_attn == "flash" and eff_attn == "sdpa") else "math"
+        log(f"[attn] requested={args.worker_attn}  effective={eff_attn}/{sdpa_kind}  fa_pref={os.environ.get('TORCH_ROCM_FA_PREFER_CK','aotriton')}")
 
         aspects = [tuple(map(int, a.split(":"))) for a in args.aspects.split(",") if a]
         batches = [int(x) for x in args.batches.split(",") if x]
@@ -286,10 +295,8 @@ def worker(args):
             for bs in batches:
                 log(f"[shape] aspect={aspect[0]}:{aspect[1]}  W={W} H={H}  packed(H/2={Hp//2}, W/2={Wp//2})  batch={bs}")
                 synth = build_synth_inputs(pipe, mode, bs, W, H, Hp, Wp, dtype)
-                # warmup
-                ws, _ = timed_forward(pipe, sdpa_kind, synth)
+                ws, _ = timed_forward(pipe, sdpa_kind, synth)  # warmup
                 log(f"[warmup] {ws:.3f}s")
-                # timed
                 per = []
                 for i in range(args.steps):
                     s, _ = timed_forward(pipe, sdpa_kind, synth)
@@ -307,44 +314,6 @@ def worker(args):
         del pipe
         if torch.cuda.is_available(): torch.cuda.empty_cache()
 
-    # aggregate for this worker
     agg_avg = sum(r["avg_s"] for r in results) / len(results)
     agg_p50 = sorted([r["p50_s"] for r in results])[len(results)//2]
-    agg_p90 = sorted([r["p90_s"] for r in results])[max(0,int(len(results)*0.9)-1)]
-    W,H,batch,aspect,mode = results[0]["W"],results[0]["H"],results[0]["batch"],results[0]["aspect"],results[0]["mode"]
-
-    log("----------------------------------------------------------------")
-    log(f"[worker summary] avg={agg_avg:.3f}s  p50={agg_p50:.3f}s  p90={agg_p90:.3f}s")
-    log("----------------------------------------------------------------")
-
-    # final JSON to STDOUT (orchestrator parses this)
-    print(json.dumps(dict(
-        avg_s=agg_avg, p50_s=agg_p50, p90_s=agg_p90,
-        W=W, H=H, batch=batch, aspect=aspect, mode=mode
-    )))
-
-# ---------------- Args ----------------
-
-def build_parser():
-    ap = argparse.ArgumentParser(description="Qwen-Image one-command ROCm bench (verbose)")
-    # orchestrator options
-    ap.add_argument("--auto-dtypes", default="bf16", help="comma list among: bf16,fp16")
-    ap.add_argument("--aspects", default="16:9")
-    ap.add_argument("--batches", default="1")
-    ap.add_argument("--base", type=int, default=1024)
-    ap.add_argument("--mode", choices=["gen","edit","both"], default="gen")
-    ap.add_argument("--steps", type=int, default=1)
-    # worker-only
-    ap.add_argument("--worker", action="store_true")
-    ap.add_argument("--worker-attn", default="sdpa")
-    ap.add_argument("--worker-mem-mb", type=int, default=2048)
-    ap.add_argument("--worker-dtype", default="bf16")
-    return ap
-
-if __name__ == "__main__":
-    parser = build_parser()
-    args = parser.parse_args()
-    if args.worker:
-        worker(args)
-    else:
-        orchestrate(args)
+    agg_p90 = sorted([r["p]()]()_
