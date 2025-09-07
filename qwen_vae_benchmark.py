@@ -25,9 +25,11 @@ def clear_miopen_cache():
     if os.path.exists(cache_dir):
         try:
             shutil.rmtree(cache_dir)
-            print(f"   Cleared MIOpen cache: {cache_dir}")
+            print(f"   Cleared MIOpen cache")
         except Exception as e:
             print(f"   Warning: Could not clear MIOpen cache: {e}")
+    else:
+        print(f"   MIOpen cache not found")
 
 # -----------------------------
 # System / GPU info helpers
