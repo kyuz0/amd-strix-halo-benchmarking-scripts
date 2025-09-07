@@ -42,6 +42,10 @@ def clear_miopen_cache():
             print(f"   Warning: Could not clear MIOpen cache: {e}")
     else:
         print(f"   MIOpen cache not found")
+    
+    # Force recompilation by disabling in-memory caching
+    os.environ["MIOPEN_DISABLE_CACHE"] = "1"
+    os.environ["MIOPEN_DEBUG_DISABLE_FIND_DB"] = "1"
 
 # -----------------------------
 # System / GPU info helpers
