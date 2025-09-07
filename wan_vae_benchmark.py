@@ -42,10 +42,18 @@ def clear_miopen_cache():
             print(f"   Warning: Could not clear MIOpen cache: {e}")
     else:
         print(f"   MIOpen cache not found")
-    
-    # Force recompilation by disabling in-memory caching
-    os.environ["MIOPEN_DISABLE_CACHE"] = "1"
-    os.environ["MIOPEN_DEBUG_DISABLE_FIND_DB"] = "1"
+
+def reload_vae(vae):
+    """Reload VAE to clear any internal MIOpen state."""
+    device = vae.device
+    dtype = vae.dtype
+    del vae.vae
+    torch.cuda.empty_cache()  # Clear GPU memory
+    # Recreate
+    vae.vae = AutoencoderKLQwenImage.from_pretrained(
+        "Qwen/Qwen-Image", subfolder="vae", torch_dtype=torch.float32
+    ).to(device)
+    vae.vae.eval()
 
 # -----------------------------
 # System / GPU info helpers
@@ -600,6 +608,7 @@ def ensure_vae(vae_path: str):
 # -----------------------------
 def run_once(vae, video, latent, *, dtype: str, tiled: bool, tile_px: int, warmup: int, env: Dict[str,str]) -> Tuple[float,float]:
     clear_miopen_cache()
+    reload_vae(vae)
     latent_tile = max(1, tile_px // STRIDE_H)  # map pixel tiles to latent tiles
     with _EnvCtx(env):
         # warmup

@@ -30,10 +30,18 @@ def clear_miopen_cache():
             print(f"   Warning: Could not clear MIOpen cache: {e}")
     else:
         print(f"   MIOpen cache not found")
-    
-    # Force recompilation by disabling in-memory caching
-    os.environ["MIOPEN_DISABLE_CACHE"] = "1"
-    os.environ["MIOPEN_DEBUG_DISABLE_FIND_DB"] = "1"
+
+def reload_vae(vae):
+    """Reload VAE to clear any internal MIOpen state."""
+    device = vae.device
+    dtype = vae.dtype
+    del vae.vae
+    torch.cuda.empty_cache()  # Clear GPU memory
+    # Recreate
+    vae.vae = AutoencoderKLQwenImage.from_pretrained(
+        "Qwen/Qwen-Image", subfolder="vae", torch_dtype=torch.float32
+    ).to(device)
+    vae.vae.eval()
 
 # -----------------------------
 # System / GPU info helpers
@@ -244,6 +252,7 @@ def bench_decode(vae: QwenVAE, lat: torch.Tensor, dtype: str, tiled: bool) -> fl
 
 def run_once(vae, img, lat, *, dtype: str, tiled: bool, warmup: int, env: Dict[str,str]) -> Tuple[float,float]:
     clear_miopen_cache()
+    reload_vae(vae)
     with _EnvCtx(env):
         if hasattr(vae.vae, "enable_tiling") and hasattr(vae.vae, "disable_tiling"):
             if tiled:
