@@ -18,6 +18,17 @@ except Exception:
     print("This script requires 'diffusers'. Install it via: pip install diffusers", file=sys.stderr)
     raise
 
+def clear_miopen_cache():
+    """Clear MIOpen cache directory to ensure clean state between tests."""
+    import shutil
+    cache_dir = os.path.expanduser("~/.cache/miopen")
+    if os.path.exists(cache_dir):
+        try:
+            shutil.rmtree(cache_dir)
+            print(f"   Cleared MIOpen cache: {cache_dir}")
+        except Exception as e:
+            print(f"   Warning: Could not clear MIOpen cache: {e}")
+
 # -----------------------------
 # System / GPU info helpers
 # -----------------------------
@@ -226,6 +237,7 @@ def bench_decode(vae: QwenVAE, lat: torch.Tensor, dtype: str, tiled: bool) -> fl
     return time.perf_counter() - start
 
 def run_once(vae, img, lat, *, dtype: str, tiled: bool, warmup: int, env: Dict[str,str]) -> Tuple[float,float]:
+    clear_miopen_cache()
     with _EnvCtx(env):
         if hasattr(vae.vae, "enable_tiling") and hasattr(vae.vae, "disable_tiling"):
             if tiled:

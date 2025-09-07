@@ -30,6 +30,17 @@ STRIDE_T = 4
 STRIDE_H = 8
 STRIDE_W = 8
 
+def clear_miopen_cache():
+    """Clear MIOpen cache directory to ensure clean state between tests."""
+    import shutil
+    cache_dir = os.path.expanduser("~/.cache/miopen")
+    if os.path.exists(cache_dir):
+        try:
+            shutil.rmtree(cache_dir)
+            print(f"   Cleared MIOpen cache: {cache_dir}")
+        except Exception as e:
+            print(f"   Warning: Could not clear MIOpen cache: {e}")
+
 # -----------------------------
 # System / GPU info helpers
 # -----------------------------
@@ -582,6 +593,7 @@ def ensure_vae(vae_path: str):
 # Run one config (with warmup)
 # -----------------------------
 def run_once(vae, video, latent, *, dtype: str, tiled: bool, tile_px: int, warmup: int, env: Dict[str,str]) -> Tuple[float,float]:
+    clear_miopen_cache()
     latent_tile = max(1, tile_px // STRIDE_H)  # map pixel tiles to latent tiles
     with _EnvCtx(env):
         # warmup
